@@ -4685,15 +4685,12 @@ static bool ImGui_ImplStbTrueType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontC
         builder->TempBuffer.resize(w * h * 1);
         unsigned char* bitmap_pixels = builder->TempBuffer.Data;
         memset(bitmap_pixels, 0, w * h * 1);
-        stbtt_MakeGlyphBitmapSubpixel(&bd_font_data->FontInfo, bitmap_pixels, r->w - oversample_h + 1, r->h - oversample_v + 1, w,
-            scale_for_raster_x, scale_for_raster_y, 0, 0, glyph_index);
 
-        // Oversampling
+        // Render with oversampling
         // (those functions conveniently assert if pixels are not cleared, which is another safety layer)
-        if (oversample_h > 1)
-            stbtt__h_prefilter(bitmap_pixels, r->w, r->h, r->w, oversample_h);
-        if (oversample_v > 1)
-            stbtt__v_prefilter(bitmap_pixels, r->w, r->h, r->w, oversample_v);
+        float sub_x, sub_y;
+        stbtt_MakeGlyphBitmapSubpixelPrefilter(&bd_font_data->FontInfo, bitmap_pixels, w, h, w,
+            scale_for_raster_x, scale_for_raster_y, 0, 0, oversample_h, oversample_v, &sub_x, &sub_y, glyph_index);
 
         const float ref_size = baked->ContainerFont->Sources[0]->SizePixels;
         const float offsets_scale = (ref_size != 0.0f) ? (baked->Size / ref_size) : 1.0f;
@@ -4703,8 +4700,8 @@ static bool ImGui_ImplStbTrueType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontC
             font_off_x = IM_ROUND(font_off_x);
         if (src->PixelSnapV)
             font_off_y = IM_ROUND(font_off_y);
-        font_off_x += stbtt__oversample_shift(oversample_h);
-        font_off_y += stbtt__oversample_shift(oversample_v) + IM_ROUND(baked->Ascent);
+        font_off_x += sub_x;
+        font_off_y += sub_y + IM_ROUND(baked->Ascent);
         float recip_h = 1.0f / (oversample_h * rasterizer_density);
         float recip_v = 1.0f / (oversample_v * rasterizer_density);
 
@@ -5374,6 +5371,11 @@ const char* ImFont::CalcWordWrapPosition(float size, const char* text, const cha
     // Cut words that cannot possibly fit within one line.
     // e.g.: "The tropical fish" with ~5 characters worth of width --> "The tr" "opical" "fish"
 
+    // Chinese punctuations are merged into nearby characters.
+    // [《短][歌][行》][曹][操：][对][酒][当][歌，][人][生][几][何！][譬][如][朝][露，][去][日][苦][多……]
+    // English words are separated even if no spaces are inserted.
+    // [ImGui][是][即][时][模][式][的][界][面][框][架。]
+
     ImFontBaked* baked = GetFontBaked(size);
     const float scale = size / baked->Size;
 
@@ -5385,6 +5387,8 @@ const char* ImFont::CalcWordWrapPosition(float size, const char* text, const cha
     const char* word_end = text;
     const char* prev_word_end = NULL;
     bool inside_word = true;
+    bool last_char_is_cjk = false;
+    bool last_char_is_init = false;
 
     const char* s = text;
     IM_ASSERT(text_end != NULL);
@@ -5428,9 +5432,43 @@ const char* ImFont::CalcWordWrapPosition(float size, const char* text, const cha
             }
             blank_width += char_width;
             inside_word = false;
+            last_char_is_cjk = false;
+            last_char_is_init = false;
+        }
+        else if (ImCharIsHeadProhibitedW(c))
+        {
+            // Can overflow, at most once.
+            line_width += word_width + blank_width;
+            word_width = 0.0f;
+            blank_width = char_width;
+            inside_word = false;
+            // Wrap after this punctuation.
+            prev_word_end = word_end = next_s;
+            last_char_is_cjk = false;
+            last_char_is_init = false;
         }
         else
         {
+            if (ImCharIsTailProhibitedW(c))
+            {
+                line_width += word_width + blank_width;
+                word_width = blank_width = 0.0f;
+                inside_word = true;
+                prev_word_end = word_end;
+                word_end = next_s;
+            }
+            else if (0x3003 <= c && c <= 0xFFFF)
+            {
+                line_width += word_width + blank_width;
+                word_width = blank_width = 0.0f;
+                inside_word = true;
+                if ((!last_char_is_init && 0x3003 <= c && c <= 0xFFFF) || !last_char_is_cjk)
+                    prev_word_end = s;
+            }
+            // CJK characters are not separated by spaces, so we treat them as a single word.
+            // This is a very simple heuristic, but it works for most cases.
+            last_char_is_cjk = 0x3003 <= c && c <= 0xFFFF;
+            last_char_is_init = ImCharIsTailProhibitedW(c);
             word_width += char_width;
             if (inside_word)
             {
